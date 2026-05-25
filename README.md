@@ -1,5 +1,5 @@
-# Description
-A menu-driven Bash &amp; PowerShell toolkit for Mixxx DJ software. Easily fix broken file paths (relink), clean missing duplicate tracks from the database, and mass export playlists to M3U8. Supports macOS, Linux, and Windows.
+# NOTICE!!!
+Even though the tools create a backup of the mixxxdb.sqlite, it is always advisable to make one before starting any tool from the script (there is option to do only backup). Even though I saved my own database, it does not mean that I have covered, all the crazy scenarios out there. Please do a backup before using any of the tools :)
 
 
 # Mixxx Library Toolkit
