@@ -148,17 +148,23 @@ relink_tracks() {
 
     echo "🗂️  Indexing filenames in $NEW_DIR (single pass)..."
     declare -A name_index
-    while IFS= read -r -d '' p; do
-        b=${p##*/}
-        if [ -z "${name_index[$b]:-}" ]; then
-            name_index["$b"]="$p"
+    while IFS= read -r -d '' k && IFS= read -r -d '' p; do
+        if [ -z "${name_index[$k]:-}" ]; then
+            name_index["$k"]="$p"
         fi
-    done < <(find "$NEW_DIR" -type f -print0)
+    done < <(find "$NEW_DIR" -type f -print0 | python3 -c '
+import sys, unicodedata
+for raw in sys.stdin.buffer.read().split(b"\0"):
+    if not raw: continue
+    p = raw.decode("utf-8", "surrogateescape")
+    b = p.rsplit("/", 1)[-1]
+    sys.stdout.buffer.write((unicodedata.normalize("NFC", b) + "\0" + p + "\0").encode("utf-8", "surrogateescape"))
+')
     echo "   Indexed ${#name_index[@]} unique filenames."
 
     tmp=$(mktemp)
     current=0
-    while IFS='|' read -r track_id track_path; do
+    while IFS='|' read -r track_id norm_basename track_path; do
         current=$((current + 1))
         if [ $((current % 500)) -eq 0 ] || [ "$current" -eq 1 ]; then
             printf '\r\033[K🔍 Scanning %d / %d tracks...' "$current" "$total" >&2
@@ -174,14 +180,21 @@ relink_tracks() {
         fi
 
         if [ ! -f "$track_path" ]; then
-            filename=${track_path##*/}
-            found_path=${name_index["$filename"]:-}
+            found_path=${name_index["$norm_basename"]:-}
             if [ -n "$found_path" ]; then
                 printf '%s|%s\n' "$track_id" "$found_path"
                 basename_hit=$((basename_hit + 1))
             fi
         fi
-    done < <(sqlite3 "$DB_PATH" "$select_sql") > "$tmp"
+    done < <(sqlite3 "$DB_PATH" "$select_sql" | python3 -c '
+import sys, unicodedata
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if not line: continue
+    tid, _, p = line.partition("|")
+    b = p.rsplit("/", 1)[-1]
+    print(tid + "|" + unicodedata.normalize("NFC", b) + "|" + p)
+') > "$tmp"
     printf '\r\033[K' >&2
 
     match_count=$(wc -l < "$tmp")
@@ -234,6 +247,122 @@ relink_only_playlists() {
         "Fast Playlist Relink"
 }
 
+find_moved_tracks() {
+    echo "--- 🔎 Find Moved/Renamed Tracks (Linux) ---"
+    echo "👉 Drag and drop or enter the folder to search for orphaned files:"
+    read -r NEW_DIR
+    if [ ! -d "$NEW_DIR" ]; then echo "❌ Folder does not exist."; return; fi
+
+    orphans=$(sqlite3 "$DB_PATH" "SELECT id, location FROM track_locations WHERE location LIKE '/Users/%' AND fs_deleted = 0;")
+    if [ -z "$orphans" ]; then
+        echo "✨ No orphaned tracks found — nothing to relocate."
+        return
+    fi
+    orphan_ids=()
+    while IFS='|' read -r oid old_loc; do
+        orphan_ids+=("$oid")
+    done <<< "$orphans"
+    em=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM track_locations WHERE location LIKE '/Users/%';")
+    echo "   Found ${#orphan_ids[@]} orphaned tracks (of $em still pointing to macOS)."
+
+    echo "🗂️  Indexing filenames under $NEW_DIR (single pass)..."
+    declare -A fs_index
+    while IFS= read -r -d '' k && IFS= read -r -d '' p; do
+        if [ -z "${fs_index[$k]:-}" ]; then
+            fs_index["$k"]="$p"
+        fi
+    done < <(find "$NEW_DIR" -type f -print0 | python3 -c '
+import sys, unicodedata
+for raw in sys.stdin.buffer.read().split(b"\0"):
+    if not raw: continue
+    p = raw.decode("utf-8", "surrogateescape")
+    b = p.rsplit("/", 1)[-1]
+    sys.stdout.buffer.write((unicodedata.normalize("NFC", b) + "\0" + p + "\0").encode("utf-8", "surrogateescape"))
+')
+    echo "   Indexed ${#fs_index[@]} unique filenames."
+
+    tmp=$(mktemp)
+    declare -A orphan_freq
+    while IFS='|' read -r _ norm_basename; do
+        orphan_freq["$norm_basename"]=$(( ${orphan_freq["$norm_basename"]:-0} + 1 ))
+    done < <(sqlite3 "$DB_PATH" "SELECT id, location FROM track_locations WHERE location LIKE '/Users/%' AND fs_deleted = 0;" | python3 -c '
+import sys, unicodedata
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if not line: continue
+    tid, _, p = line.partition("|")
+    print(tid + "|" + unicodedata.normalize("NFC", p.rsplit("/", 1)[-1]))
+')
+    dup_skip=0
+    while IFS='|' read -r oid norm_basename; do
+        [ "${orphan_freq[$norm_basename]}" -gt 1 ] && continue
+        found=${fs_index[$norm_basename]:-}
+        if [ -n "$found" ]; then
+            exists=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM track_locations WHERE location = '${found//\'/\'\'}';")
+            if [ "$exists" -eq 0 ]; then
+                printf '%s|%s\n' "$oid" "$found"
+            else
+                dup_skip=$((dup_skip + 1))
+            fi
+        fi
+    done < <(sqlite3 "$DB_PATH" "SELECT id, location FROM track_locations WHERE location LIKE '/Users/%' AND fs_deleted = 0;" | python3 -c '
+import sys, unicodedata
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if not line: continue
+    tid, _, p = line.partition("|")
+    print(tid + "|" + unicodedata.normalize("NFC", p.rsplit("/", 1)[-1]))
+') > "$tmp"
+
+    match_count=$(wc -l < "$tmp")
+    echo "✅ Filesystem matches by filename: $match_count / ${#orphan_ids[@]} orphans (skipped $dup_skip already-present duplicates)."
+    if [ "$match_count" -eq 0 ]; then
+        rm -f "$tmp"
+        echo "   No files found. They may have been renamed or truly deleted."
+        return
+    fi
+
+    echo "--------------------------------------------------"
+    echo "Proposed re-points (unambiguous filename matches only):"
+    while IFS='|' read -r oid nloc; do
+        printf '  [%s] -> %s\n' "$oid" "$nloc"
+    done < "$tmp"
+    read -p "🗑️  Apply these $match_count re-points? Type 'yes': " confirm
+    if [ "$confirm" != "yes" ]; then
+        echo "Aborted. No changes made."
+        rm -f "$tmp"
+        return
+    fi
+    make_backup
+
+    sqlfile=$(mktemp)
+    {
+        echo ".bail on"
+        echo "PRAGMA foreign_keys = OFF;"
+        echo "PRAGMA busy_timeout = 10000;"
+        echo "BEGIN IMMEDIATE;"
+        echo "CREATE TEMP TABLE relink_targets(id INTEGER PRIMARY KEY, new_loc TEXT);"
+        while IFS='|' read -r oid nloc; do
+            escaped="${nloc//\'/\'\'}"
+            printf "INSERT INTO relink_targets VALUES (%s, '%s');\n" "$oid" "$escaped"
+        done < "$tmp"
+        echo "UPDATE OR IGNORE track_locations SET location = (SELECT rt.new_loc FROM relink_targets rt WHERE rt.id = track_locations.id) WHERE id IN (SELECT id FROM relink_targets);"
+        echo "SELECT changes();"
+        echo "DROP TABLE relink_targets;"
+        echo "COMMIT;"
+    } > "$sqlfile"
+
+    apply_out=$(sqlite3 "$DB_PATH" < "$sqlfile")
+    apply_status=$?
+    rm -f "$sqlfile" "$tmp"
+    if [ "$apply_status" -ne 0 ]; then
+        echo "❌ Error applying updates (sqlite3 exit $apply_status). Nothing was committed."
+    else
+        relinked=$(printf '%s\n' "$apply_out" | tail -n1)
+        echo "✅ Find Moved/Renamed: $relinked tracks re-pointed."
+    fi
+}
+
 relink_all_library() {
     echo "--- 📁 Universal Relink Entire Library (Linux) ---"
     echo "👉 Drag and drop or enter the NEW FOLDER containing all your music:"
@@ -250,15 +379,16 @@ relink_all_library() {
 clean_library() {
     echo "--- 🧹 Clean Missing Tracks & VACUUM (Linux) ---"
     total=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM track_locations;")
+    missing=0
     ids_to_delete=()
     while IFS='|' read -r track_id track_path; do
         if [ ! -f "$track_path" ]; then
             echo "❌ Missing from disk: $track_path"
             ids_to_delete+=("$track_id")
+            missing=$((missing + 1))
         fi
     done < <(sqlite3 "$DB_PATH" "SELECT id, location FROM track_locations;")
 
-    missing=${#ids_to_delete[@]}
     if [ "$missing" -eq 0 ]; then
         echo "✨ Library is clean! No missing files found."
         return
@@ -272,23 +402,92 @@ clean_library() {
         echo "   them from Mixxx: playlists, cues, ratings, play counts and history."
         echo "   Mixxx's own 'Purge deleted tracks' is safer; this option HARD-deletes records."
     fi
+
+    comma_separated_ids=$(IFS=,; echo "${ids_to_delete[*]}")
+
+    merge_map=""
+    if [ "$missing" -gt 0 ]; then
+        merge_map=$(sqlite3 "$DB_PATH" "
+            SELECT o.id || '|' || l.id
+            FROM track_locations o
+            JOIN track_locations l
+              ON l.filename = o.filename
+             AND l.location LIKE '/home/brain/%'
+             AND o.filesize = l.filesize
+             AND o.filesize > 0
+             AND o.id <> l.id
+            WHERE o.id IN ($comma_separated_ids)
+            GROUP BY o.id
+            HAVING COUNT(*) = 1
+            UNION ALL
+            SELECT o.id || '|' || l.id
+            FROM track_locations o
+            JOIN track_locations l
+              ON l.location LIKE '/home/brain/%'
+             AND o.filesize = l.filesize
+             AND o.filesize > 0
+             AND o.id <> l.id
+             AND lower(substr(l.location,-4)) = lower(substr(o.location,-4))
+            JOIN library lo ON lo.id = o.id
+            JOIN library ll ON ll.id = l.id
+            WHERE ABS(ll.duration - lo.duration) < 0.5
+              AND o.id IN ($comma_separated_ids)
+              AND o.id NOT IN (
+                  SELECT o2.id FROM track_locations o2
+                  JOIN track_locations l2
+                    ON l2.filename = o2.filename
+                   AND l2.location LIKE '/home/brain/%'
+                   AND o2.filesize = l2.filesize
+                   AND o2.filesize > 0
+                   AND o2.id <> l2.id
+                  GROUP BY o2.id
+                  HAVING COUNT(*) = 1
+              )
+            GROUP BY o.id
+            HAVING COUNT(*) = 1;")
+    fi
+    merge_count=0
+    if [ -n "$merge_map" ]; then
+        merge_count=$(printf '%s\n' "$merge_map" | wc -l)
+        echo "   Of those, $merge_count are duplicates of a surviving copy (same file, possibly renamed)."
+        echo "   Their cues, rating, play count and crate membership will be MERGED into the"
+        echo "   surviving copy before the orphan row is removed."
+    fi
+
     read -p "🗑️  Hard-delete these $missing records? Type 'yes': " confirm
     if [ "$confirm" != "yes" ]; then
         echo "Aborted. No changes made."
         return
     fi
     make_backup
-    comma_separated_ids=$(IFS=,; echo "${ids_to_delete[*]}")
     sqlite3 "$DB_PATH" <<EOF
 PRAGMA foreign_keys = OFF;
+BEGIN IMMEDIATE;
+CREATE TEMP TABLE merge_pairs(orphan_id INTEGER PRIMARY KEY, keep_id INTEGER);
+$( [ -n "$merge_map" ] && printf '%s\n' "$merge_map" | while IFS='|' read -r oid kid; do printf "INSERT OR IGNORE INTO merge_pairs VALUES (%s, %s);\n" "$oid" "$kid"; done )
+UPDATE cues SET track_id = (SELECT keep_id FROM merge_pairs WHERE orphan_id = cues.track_id)
+  WHERE track_id IN (SELECT orphan_id FROM merge_pairs);
+UPDATE track_analysis SET track_id = (SELECT keep_id FROM merge_pairs WHERE orphan_id = track_analysis.track_id)
+  WHERE track_id IN (SELECT orphan_id FROM merge_pairs);
+INSERT OR IGNORE INTO crate_tracks (crate_id, track_id)
+  SELECT ct.crate_id, mp.keep_id FROM crate_tracks ct JOIN merge_pairs mp ON ct.track_id = mp.orphan_id;
+INSERT OR IGNORE INTO PlaylistTracks (playlist_id, track_id, position, pl_datetime_added)
+  SELECT pt.playlist_id, mp.keep_id, pt.position, pt.pl_datetime_added
+  FROM PlaylistTracks pt JOIN merge_pairs mp ON pt.track_id = mp.orphan_id
+  WHERE NOT EXISTS (SELECT 1 FROM PlaylistTracks pt2
+                    WHERE pt2.playlist_id = pt.playlist_id AND pt2.track_id = mp.keep_id);
 DELETE FROM cues WHERE track_id IN ($comma_separated_ids);
+DELETE FROM track_analysis WHERE track_id IN ($comma_separated_ids);
 DELETE FROM crate_tracks WHERE track_id IN ($comma_separated_ids);
 DELETE FROM PlaylistTracks WHERE track_id IN ($comma_separated_ids);
 DELETE FROM library WHERE id IN ($comma_separated_ids);
 DELETE FROM track_locations WHERE id IN ($comma_separated_ids);
+DROP TABLE merge_pairs;
+COMMIT;
 VACUUM;
 EOF
     echo "🎉 Database cleaned and compressed successfully!"
+    [ "$merge_count" -gt 0 ] && echo "   Merged history of $merge_count duplicates into their surviving copies."
 }
 
 export_playlists_m3u8() {
@@ -320,15 +519,17 @@ while true; do
     echo "3) 🧹 Clean Missing Tracks & VACUUM"
     echo "4) 🎶 Export Playlists to M3U8"
     echo "5) 💾 Quick Backup"
-    echo "6) ❌ Exit"
-    read -p "Please select an action [1-6]: " choice
+    echo "6) 🔎 Find Moved/Renamed Tracks"
+    echo "7) ❌ Exit"
+    read -p "Please select an action [1-7]: " choice || break
     case $choice in
         1) relink_only_playlists ;;
         2) relink_all_library ;;
         3) clean_library ;;
         4) export_playlists_m3u8 ;;
         5) make_backup ;;
-        6) echo "Goodbye!"; exit 0 ;;
+        6) find_moved_tracks ;;
+        7) echo "Goodbye!"; exit 0 ;;
         *) echo "❌ Invalid option. Please try again." ;;
     esac
 done
